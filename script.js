@@ -181,6 +181,106 @@
     runURL(url);
   }
 
+  /* ── Proxy-based URL loading ────────────────────────── */
+
+  const PROXY_SERVICES = [
+    'https://api.allorigins.win/raw?url=',
+    'https://api.codetabs.com/v1/proxy?quest=',
+  ];
+
+  /**
+   * Rewrite relative URLs in HTML to absolute ones so they
+   * resolve correctly when loaded inside a blob/srcdoc iframe.
+   */
+  function rewriteRelativeURLs(html, baseURL) {
+    let base;
+    try { base = new URL(baseURL); } catch { return html; }
+
+    const origin = base.origin;
+    const pathname = base.pathname.replace(/\/[^/]*$/, '/');
+
+    // <base href>
+    html = html.replace(/(<base\s[^>]*href=["'])([^"']+)(["'])/i, '$1' + origin + pathname + '$3');
+
+    // Rewrite src, href, poster, data, action attributes (skip data: and javascript: and http(s):)
+    const attrPattern = /((?:src|href|poster|data|action)\s*=\s*["'])(?!data:|javascript:|https?:\/\/|#)([^"']+)(["'])/gi;
+    html = html.replace(attrPattern, (match, prefix, path, suffix) => {
+      if (path.startsWith('//')) return prefix + 'https:' + path + suffix;
+      try {
+        const resolved = new URL(path, base).href;
+        return prefix + resolved + suffix;
+      } catch {
+        return match;
+      }
+    });
+
+    // Rewrite url() in inline styles
+    html = html.replace(/(url\(\s*["']?)(?!data:|javascript:|https?:\/\/|#)([^"')]+)(["']?\s*\))/gi, (match, prefix, path, suffix) => {
+      try {
+        return prefix + new URL(path, base).href + suffix;
+      } catch {
+        return match;
+      }
+    });
+
+    return html;
+  }
+
+  /**
+   * Add a <base> tag if none exists, so relative paths resolve
+   * against the original site origin.
+   */
+  function ensureBaseTag(html, baseURL) {
+    let base;
+    try { base = new URL(baseURL); } catch { return html; }
+
+    const origin = base.origin;
+    const dirPath = base.pathname.replace(/\/[^/]*$/, '/');
+
+    if (/<base\s/i.test(html)) return html;
+
+    // Inject after <head> or at the very start
+    const baseTag = `<base href="${origin}${dirPath}">`;
+    if (/<head[^>]*>/i.test(html)) {
+      return html.replace(/(<head[^>]*>)/i, '$1' + baseTag);
+    }
+    return baseTag + html;
+  }
+
+  /**
+   * Fetch a URL through a CORS proxy and return the HTML text.
+   */
+  async function fetchViaProxy(url) {
+    for (const proxy of PROXY_SERVICES) {
+      try {
+        const resp = await fetch(proxy + encodeURIComponent(url), {
+          signal: AbortSignal.timeout(10000),
+        });
+        if (resp.ok) {
+          const text = await resp.text();
+          if (text && text.length > 50) return text;
+        }
+      } catch {
+        // try next proxy
+      }
+    }
+    return null;
+  }
+
+  /**
+   * Try direct fetch (works for CORS-friendly sites).
+   */
+  async function fetchDirect(url) {
+    try {
+      const resp = await fetch(url, {
+        mode: 'cors',
+        signal: AbortSignal.timeout(8000),
+      });
+      if (resp.ok) return await resp.text();
+    } catch {}
+    return null;
+  }
+
   function runURL(url) {
     if (state.isLoading) return;
     state.isLoading = true;
@@ -190,14 +290,15 @@
     showLoading();
 
     let settled = false;
+    let loadTimeout = null;
 
     function settle(success, message) {
       if (settled) return;
       settled = true;
       state.isLoading = false;
+      clearTimeout(loadTimeout);
       dom.progressBar.style.width = '100%';
 
-      // Clean up handlers so stale loads don't re-trigger
       dom.iframe.onload = null;
       dom.iframe.onerror = null;
 
@@ -208,7 +309,7 @@
         } else {
           showError(
             'Load Failed',
-            message || 'The page could not be loaded. It may block iframe embedding (X-Frame-Options / CSP).'
+            message || 'Could not load this site. It may block external access or be unreachable.'
           );
         }
         dom.btnOpen.disabled = false;
@@ -216,30 +317,13 @@
       }, 250);
     }
 
-    // Attach handlers BEFORE setting src to avoid race condition
-    dom.iframe.onload = () => {
-      // Give browser a moment to finalize, then consider it loaded.
-      // If the site blocks iframe embedding, onload still fires
-      // but the iframe shows an error page — we show it anyway
-      // since there is no JS-accessible way to detect that cross-origin.
-      setTimeout(() => settle(true), 400);
-    };
-
-    dom.iframe.onerror = () => {
-      settle(false, 'Network error — could not reach the URL.');
-    };
-
-    // Now assign src (handlers are already listening)
-    dom.iframe.src = url;
-
-    // Start phased loading animation
+    // Phased loading animation
     const phases = [
-      { text: 'Connecting...',      pct: 18,  delay: 350 },
-      { text: 'Resolving host...',  pct: 35,  delay: 300 },
-      { text: 'Loading content...', pct: 60,  delay: 400 },
-      { text: 'Rendering view...',  pct: 85,  delay: 350 },
+      { text: 'Connecting...',      pct: 15,  delay: 300 },
+      { text: 'Fetching content...',pct: 35,  delay: 400 },
+      { text: 'Processing HTML...', pct: 60,  delay: 350 },
+      { text: 'Rendering view...',  pct: 85,  delay: 300 },
     ];
-
     let phaseIndex = 0;
     const advancePhase = () => {
       if (phaseIndex >= phases.length || !state.isLoading) return;
@@ -251,10 +335,55 @@
     };
     advancePhase();
 
-    // Timeout — generous 20s for slow connections
-    setTimeout(() => {
-      if (!settled) settle(false, 'Request timed out after 20 seconds. The site may be slow or blocking iframe embedding.');
-    }, 20000);
+    // Master timeout
+    loadTimeout = setTimeout(() => {
+      settle(false, 'Timed out — the site took too long to respond.');
+    }, 18000);
+
+    // ── Step 1: Try direct fetch first ──
+    (async () => {
+      let html = await fetchDirect(url);
+
+      // ── Step 2: Fall back to proxy ──
+      if (!html) {
+        dom.statusText.textContent = 'Using proxy...';
+        html = await fetchViaProxy(url);
+      }
+
+      if (!state.isLoading) return;
+
+      if (!html) {
+        settle(false, 'Could not fetch the page content. The site may be unreachable or blocking all access.');
+        return;
+      }
+
+      // ── Step 3: Rewrite relative URLs and inject base tag ──
+      html = ensureBaseTag(html, url);
+      html = rewriteRelativeURLs(html, url);
+
+      // ── Step 4: Strip frame-busting scripts ──
+      html = html.replace(/<script[^>]*>[\s\S]*?(top|parent|self)\s*(!=|===?|!==?)\s*(self|top|parent)[\s\S]*?<\/script>/gi, '<!-- frame-buster removed -->');
+      html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?X-Frame-Options["']?[^>]*>/gi, '');
+      html = html.replace(/<meta[^>]*http-equiv\s*=\s*["']?Content-Security-Policy["']?[^>]*>/gi, '');
+
+      // ── Step 5: Load into iframe via blob URL ──
+      dom.progressBar.style.width = '90%';
+
+      const blob = new Blob([html], { type: 'text/html;charset=utf-8' });
+      const blobURL = URL.createObjectURL(blob);
+
+      dom.iframe.onload = () => {
+        URL.revokeObjectURL(blobURL);
+        setTimeout(() => settle(true), 200);
+      };
+
+      dom.iframe.onerror = () => {
+        URL.revokeObjectURL(blobURL);
+        settle(false, 'Failed to render the page in the viewer.');
+      };
+
+      dom.iframe.src = blobURL;
+    })();
   }
 
   function stopLoading() {
