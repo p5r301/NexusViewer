@@ -127,6 +127,10 @@
     showViewerState('stateIdle');
     dom.statusBar.classList.add('hidden');
     dom.progressBar.style.width = '0%';
+    // Reset iframe state
+    dom.iframe.onload = null;
+    dom.iframe.onerror = null;
+    dom.iframe.src = 'about:blank';
   }
 
   function showLoading() {
@@ -178,33 +182,12 @@
   }
 
   function runURL(url) {
+    if (state.isLoading) return;
     state.isLoading = true;
     dom.btnOpen.disabled = true;
     dom.btnStop.disabled = false;
 
     showLoading();
-
-    // Phased loading simulation
-    const phases = [
-      { text: 'Connecting...',      pct: 18,  delay: 380 },
-      { text: 'Resolving host...',  pct: 35,  delay: 320 },
-      { text: 'Loading content...', pct: 58,  delay: 380 },
-      { text: 'Rendering view...',  pct: 82,  delay: 280 },
-    ];
-
-    let phaseIndex = 0;
-    const advancePhase = () => {
-      if (phaseIndex >= phases.length || !state.isLoading) return;
-      const p = phases[phaseIndex++];
-      dom.statusText.textContent = p.text;
-      dom.progressBar.style.width = p.pct + '%';
-      typewrite(dom.loaderText, p.text);
-      setTimeout(advancePhase, p.delay);
-    };
-    advancePhase();
-
-    // Load iframe
-    dom.iframe.src = url;
 
     let settled = false;
 
@@ -213,6 +196,10 @@
       settled = true;
       state.isLoading = false;
       dom.progressBar.style.width = '100%';
+
+      // Clean up handlers so stale loads don't re-trigger
+      dom.iframe.onload = null;
+      dom.iframe.onerror = null;
 
       setTimeout(() => {
         if (success) {
@@ -229,23 +216,52 @@
       }, 250);
     }
 
+    // Attach handlers BEFORE setting src to avoid race condition
     dom.iframe.onload = () => {
-      setTimeout(() => settle(true), 150);
+      // Give browser a moment to finalize, then consider it loaded.
+      // If the site blocks iframe embedding, onload still fires
+      // but the iframe shows an error page — we show it anyway
+      // since there is no JS-accessible way to detect that cross-origin.
+      setTimeout(() => settle(true), 400);
     };
 
     dom.iframe.onerror = () => {
       settle(false, 'Network error — could not reach the URL.');
     };
 
-    // Timeout
+    // Now assign src (handlers are already listening)
+    dom.iframe.src = url;
+
+    // Start phased loading animation
+    const phases = [
+      { text: 'Connecting...',      pct: 18,  delay: 350 },
+      { text: 'Resolving host...',  pct: 35,  delay: 300 },
+      { text: 'Loading content...', pct: 60,  delay: 400 },
+      { text: 'Rendering view...',  pct: 85,  delay: 350 },
+    ];
+
+    let phaseIndex = 0;
+    const advancePhase = () => {
+      if (phaseIndex >= phases.length || !state.isLoading) return;
+      const p = phases[phaseIndex++];
+      dom.statusText.textContent = p.text;
+      dom.progressBar.style.width = p.pct + '%';
+      typewrite(dom.loaderText, p.text);
+      setTimeout(advancePhase, p.delay);
+    };
+    advancePhase();
+
+    // Timeout — generous 20s for slow connections
     setTimeout(() => {
-      if (!settled) settle(false, 'Request timed out after 12 seconds.');
-    }, 12000);
+      if (!settled) settle(false, 'Request timed out after 20 seconds. The site may be slow or blocking iframe embedding.');
+    }, 20000);
   }
 
   function stopLoading() {
     if (!state.isLoading) return;
     state.isLoading = false;
+    dom.iframe.onload = null;
+    dom.iframe.onerror = null;
     dom.iframe.src = 'about:blank';
     resetViewer();
     dom.btnOpen.disabled = false;
